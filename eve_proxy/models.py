@@ -1,71 +1,55 @@
-import httplib
-import urllib
+import sys
+import logging
+import urllib, urllib2
+from hashlib import sha1
 from datetime import datetime, timedelta
-from xml.parsers.expat import ExpatError
-from xml.etree import ElementTree
-from django.db import models
-from django.conf import settings
-from eve_proxy.proxy_exceptions import InvalidAPIResponseException
-from eve_proxy.api_error_exceptions import APIQueryErrorException
+from xml.dom import minidom
 
-# To change this, create a variable in your local_settings.py called
-# EVE_API_URL, which will be grabbed from here.
-API_URL = getattr(settings, 'EVE_API_URL', 'api.eve-online.com')
+from django.db import models, IntegrityError
+from django.conf import settings
+from django.core.cache import cache
+
+from eve_proxy.exceptions import *
+
+# API URL, can be overriden in the configuration
+API_URL = getattr(settings, 'EVE_API_URL', 'https://api.eve-online.com')
+
+# Errors to rollback if we have a cached version of the document
+ROLLBACK_ERRORS = range(516, 902)
+
+# Errors ignored if encountered, as they're valid responses in some cases
+IGNORED_ERRORS = range(200, 223)
+
+def stat_update_count(key, incr=1):
+    """Increment a key on the Cache, for stats monitoring"""
+    if getattr(settings, 'EVE_PROXY_STATS', False) and len(getattr(settings, 'CACHES', {})):
+        try:
+            cache.incr(key, incr)
+        except ValueError:
+            cache.set(key, incr, 2592000)
 
 class CachedDocumentManager(models.Manager):
     """
     This manager handles querying or retrieving CachedDocuments.
     """
-    def cache_from_eve_api(self, cached_doc, url_path, params, no_cache=False):
-        """
-        Connect to the EVE API server, send the request, and cache it to
-        a CachedDocument. This is typically not something you want to call
-        directly. Use api_query().
-        """
-        headers = {"Content-type": "application/x-www-form-urlencoded"}
-        # This is the connection to the EVE API server.
-        conn = httplib.HTTPConnection(API_URL)
-        # Combine everything into an HTTP request.
-        conn.request("POST", url_path, params, headers)
-        # Retrieve the response from the server.
-        response = conn.getresponse()
-        # Save the response (an XML document) to the CachedDocument.
-        cached_doc.body = response.read()
-    
-        try:
-            # Parse the response via minidom
-            tree = ElementTree.fromstring(cached_doc.body)
-        except ExpatError:
-            raise InvalidAPIResponseException(cached_doc.body)
 
-        # Set the CachedDocument's time_retrieved and cached_until times based
-        # on the values in the XML response. This will be used in future
-        # requests to see if the CachedDocument can be retrieved directly or
-        # if it needs to be re-cached.
-        cached_doc.time_retrieved = datetime.utcnow()
-        try:
-            cached_doc.cached_until = tree.find('cachedUntil').text
-        except IndexError:
-            # When we see failure here, we can safely assume that the response
-            # is malformed, since all API responses have a cachedUntil tag.
-            raise InvalidAPIResponseException(cached_doc.body)
-        
-        if "WalletJournal.xml.aspx" in url_path:
-            # There's a bug in the cachedUntil attribute on WalletJournal
-            # queries that incorrectly reports the wrong cache value. It says
-            # 15 minutes, but should be an hour, so add the difference,
-            # which is 45 minutes (to make it an hour).
-            # Keep an eye on a fix from CCP, this will need to be removed
-            # if and when they get around to it.
-            cached_doc.cached_until += timedelta(minutes=45)
-    
-        # Finish up and return the resulting document just in case.
-        if no_cache == False:
-            cached_doc.save()
+    def construct_url(self, url_path, params):
 
-        return tree
-    
-    def api_query(self, url_path, params=None, no_cache=False):
+         # Valid arguments for EVE API Calls
+        allowed_params = ['apikey', 'userid', 'keyid', 'vcode', 'characterid', 'version', 'names', 'ids', 'corporationid', 'beforerefid', 'accountkey']
+
+        if len(params):
+            for k, v in params.items():
+                del params[k]
+                if k.lower() in allowed_params:
+                   params[k.lower()] = v
+            url = "%s%s?%s" % (API_URL, url_path, urllib.urlencode(params))
+        else:
+            url = "%s%s" % (API_URL, url_path)
+
+        return url
+
+    def api_query(self, url_path, params={}, no_cache=False, exceptions=True, timeout=getattr(settings, 'EVE_PROXY_TIMEOUT', 60), service="Auth"):
         """
         Transparently handles querying EVE API or retrieving the document from
         the cache.
@@ -77,77 +61,133 @@ class CachedDocumentManager(models.Manager):
                                     May also be a string representation of
                                     the query: userID=1&characterID=xxxxxxxx
         """
-        if type({}) == type(params):
-            # If 'params' is a dictionary, we're good to go.
-            pass
-        elif params == None or params.strip() == '':
-            # For whatever reason, EVE API freaks out if there are no parameters.
-            # Add a bogus parameter if none are specified. I'm sure there's a
-            # better fix for this.
-            params = {'odd_parm': '1'}
-        
-        # Convert params to a URL encoded string.    
-        params = urllib.urlencode(params)
-        
-        # Combine the URL path and the parameters to create the full query.
-        query_name = '%s?%s' % (url_path, params)
-        
-        if no_cache:
-            # If no_cache is enabled, don't even attempt a lookup.
-            cached_doc = CachedDocument(url_path=query_name)
-            created = False
-        else:
-            # Retrieve or create a new CachedDocument based on the full URL
-            # and parameters.
-            cached_doc, created = self.get_or_create(url_path=query_name)
-    
-        # EVE uses UTC.
-        current_eve_time = datetime.utcnow()
 
-        # Figure out if we need hit EVE API and re-cache, or just pull from
-        # the local cache (based on cached_until).
-        if no_cache or created or \
-          cached_doc.cached_until == None or \
-          current_eve_time > cached_doc.cached_until:
-            # Cache from EVE API
-            tree = self.cache_from_eve_api(cached_doc, url_path, params, 
-                                    no_cache=no_cache)
-        else:
-            # Parse the document here since it was retrieved from the
-            # database cache instead of queried for.
-            tree = ElementTree.fromstring(cached_doc.body)
-        
-        if not tree:
-            # When we see failure here, we can safely assume that the response
-            # is malformed, since all API responses have a cachedUntil tag.
-            raise InvalidAPIResponseException(cached_doc.body)
-        
-        # Check for the presence errors. Only check the bare minimum,
-        # generic stuff that applies to most or all queries. User-level code
-        # should check for the more specific errors.
-        error_node = tree.find('error')
-        if error_node != None:
-            error_code = int(error_node.get('code'))
-            error_message = error_node.text
-            raise APIQueryErrorException(error_code, error_message)
-            
-        return cached_doc
-    
-    def clean_expired_entries(self):
-        """
-        Cleanses the cache of any expired CachedDocument objects. This can
-        be called periodically if the user is concerned about DB bloat.
-        """
-        CachedDocument.objects.filter(cached_until__lte=datetime.now).delete()
+        logger = logging.getLogger('eve_proxy.CachedDocument')
+
+        url = self.construct_url(url_path, params)
+        doc_key = sha1(url).hexdigest()
+
+        logger.debug('Requesting URL: %s' % url)
+
+        try:
+            doc = super(CachedDocumentManager, self).get_query_set().get(pk=doc_key)
+            created = False
+        except self.model.DoesNotExist:
+            doc = CachedDocument(pk=doc_key, url_path=url)
+            created = True
+
+        if created or not doc.cached_until or datetime.utcnow() > doc.cached_until or no_cache:
+
+            stat_update_count('eve_proxy_api_requests')
+            req = urllib2.Request(url)
+            # Add a header with the admin information in, so CCP can traceback the requests if needed
+            if settings.ADMINS:
+                req.add_header('CCP-Contact', str(', ').join(['%s <%s>' % (name, email) for name, email in settings.ADMINS]))
+
+            try:
+                if sys.version_info < (2, 6):
+                    conn = urllib2.urlopen(req)
+                else:
+                    conn = urllib2.urlopen(req, timeout=timeout)
+            except urllib2.HTTPError, e:
+                if not created:
+                    pass
+                logger.error('HTTP Error Code: %s' % e.code, exc_info=sys.exc_info(), extra={'data': {'api-url': url}})
+                stat_update_count('eve_proxy_api_exception')
+                raise DocumentRetrievalError(e.code)
+            except urllib2.URLError, e:
+                if not created:
+                    pass
+                logger.error('URL Error: %s' % e, exc_info=sys.exc_info(), extra={'data': {'api-url': url}})
+                stat_update_count('eve_proxy_api_exception')
+                raise DocumentRetrievalError(e.reason)
+            else:
+                doc.body = unicode(conn.read(), 'utf-8')
+                doc.time_retrieved = datetime.utcnow()
+
+            error = 0
+            try:
+                # Parse the response via minidom
+                dom = minidom.parseString(doc.body.encode('utf-8'))
+            except:
+                doc.cached_until = datetime.utcnow()
+            else:
+                date = datetime.strptime(dom.getElementsByTagName('cachedUntil')[0].childNodes[0].nodeValue, '%Y-%m-%d %H:%M:%S')
+                # Add 30 seconds to the cache timers, avoid hitting too early and account for some minor clock skew.
+                doc.cached_until = date + timedelta(seconds=getattr(settings, 'EVE_PROXY_CACHE_ADJUSTMENT', 30))
+                enode = dom.getElementsByTagName('error')
+                if enode:
+                   error = enode[0].getAttribute('code')
+
+            if error:
+                stat_update_count('eve_proxy_api_error')
+                stat_update_count('eve_proxy_api_error_%s' % int(error))
+                # If we have a rollback error, try and retreive a correct version from the DB
+                if int(error) in ROLLBACK_ERRORS:
+                    try:
+                        doc = self.get(pk=doc.pk)
+                    except self.model.DoesNotExist:
+                        doc.save()
+                else:
+                    if not int(error) in IGNORED_ERRORS:
+                        logger.error("API Error %s encountered - %s" % (error, url), extra={'data': {'api-url': url, 'error': error, 'document': doc.body}})
+                    else:
+                        doc.save()
+            else:
+                doc.save()
+                stat_update_count('eve_proxy_api_success')
+
+            # If this is user related, write a log instance
+            if params and (params.get('userid', None) or params.get('keyid', None)):
+                stat_update_count('eve_proxy_api_authenticated_requests')
+                try:
+                    v = int(params.get('userid', None) or int(params.get('keyid', None))) 
+                except:
+                    pass
+                else:
+                    fparams = {}
+                    for k in params:
+                        if not k in ['userid', 'apikey', 'vcode', 'keyid']: fparams[k] = params[k]
+
+                    ApiAccessLog(userid=v, service=service, time_access=doc.time_retrieved, document=self.construct_url(url_path, fparams)).save()
+
+        return doc
 
 class CachedDocument(models.Model):
     """
     This is a cached XML document from the EVE API.
     """
-    url_path = models.CharField(max_length=255)
-    body = models.TextField()
-    time_retrieved = models.DateTimeField(blank=True, null=True)
-    cached_until = models.DateTimeField(blank=True, null=True)
+    doc_key = models.CharField("Document Key", max_length=40, primary_key=True, help_text="A unique SHA1 hash of the request")
+    url_path = models.CharField("URL Path", max_length=255, help_text="The full EVE API url path of this document")
+    body = models.TextField("Body", help_text="The raw XML document from the EVE API")
+    time_retrieved = models.DateTimeField(blank=True, null=True, help_text="UTC date/time of when the document was retreived from the EVE API")
+    cached_until = models.DateTimeField(blank=True, null=True, help_text="UTC date/time specifying when this document should be cached until")
 
     # The custom manager handles the querying.
     objects = CachedDocumentManager()
+
+    def __unicode__(self):
+        return u'%s - %s' % (self.doc_key, self.time_retrieved)
+
+    class Meta:
+        verbose_name = 'Cached Document'
+        verbose_name_plural = 'Cached Documents'
+        ordering = ['-time_retrieved']
+
+
+class ApiAccessLog(models.Model):
+    """
+    Provides a list of API accesses made by applications or Auth
+    """
+    userid = models.IntegerField("User ID", help_text="The API User ID related to this log")
+    service = models.CharField("Service Name", max_length=255, help_text="The service name that requested the document")
+    time_access = models.DateTimeField("Date/Time Accessed", help_text="The date/time the document was requested")
+    document = models.CharField("Document Path", max_length=255, help_text="The path to the requested document")
+
+    def __unicode__(self):
+        return u'Key %s - %s' % (self.userid, self.document)
+
+    class Meta:
+        verbose_name = 'API Access Log'
+        verbose_name_plural = 'API Access Logs'
+        ordering = ['-time_access']
