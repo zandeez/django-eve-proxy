@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 from distutils.core import setup
-from eve_proxy import VERSION
+from eve_proxy import str_version
 
 LONG_DESCRIPTION = open('README.rst', 'r').read()
 
@@ -18,7 +18,7 @@ CLASSIFIERS = [
 KEYWORDS = 'EVE Online CCP Django proxy'
 
 setup(name='django-eve-proxy',
-      version=VERSION,
+      version=str_version,
       description="A Django-based EVE API proxy.",
       long_description=LONG_DESCRIPTION,
       author='Gregory Taylor',
